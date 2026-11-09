@@ -127,8 +127,29 @@ def detect_cuts(frames):
     med = float(np.median(body))
     thr = max(CUT_FLOOR, med * 3.2)
     cands = [i for i in range(1, n) if diffs[i] > thr]
+    if not cands:
+        return [], diffs
+
+    # ---- 先剔除「运动密集段」，再做持续性校验 ----
+    # 顺序很重要（踩过）：如果先做持续性校验（间隔 >=10 帧去重），
+    # 甩镜那一串候选会被压成稀疏的 3 个点，密度反而看不出来，过滤就失效了。
+    # 实测原始候选的密度（±10 帧窗口，不含自己）：
+    #   G_5005（甩镜）  候选 28 个连成一片，每个点密度 15~20
+    #   00153（真硬切）f82 簇 4 个、f98 簇 3 个，两点相距 16 帧
+    # 所以窗口要**小于两簇间距**（16），否则真假切点会被连成一片。
+    WINDOW = 10
+    DENSE = 4      # ±10 帧内超过这么多个同伴 = 一段持续运动
+
+    def dense(c):
+        return sum(1 for o in cands if abs(o - c) <= WINDOW) - 1
+
+    quiet = [c for c in cands if dense(c) <= DENSE]
+    if not quiet:
+        # 整段都在动（纯甩镜），没有任何一处安静 → 没有任何切镜
+        return [], diffs
+
     cuts = []
-    for c in cands:
+    for c in quiet:
         probe = min(c + 10, n - 1)
         if probe <= c:
             keep = True
@@ -253,6 +274,103 @@ def aggregate_regions(a, b):
     }
 
 
+# ---------------------------------------------------------------- 清晰度 / 运动模糊
+# 为什么需要这个模块（踩过的坑，别删）：
+#   早期版本只用「几何位移」判所有运镜，结果把 whip pan 判成「低置信度/无效」。
+#   实际上甩镜的特征不是位移，而是**画面糊成横向光带**——中间帧根本拟合不出运动。
+#   工具报「低置信度」恰恰是它生效的签名，不是失败。
+#   => 几何运动与画面模糊是**两类独立信号**，必须分开测。
+BLUR_DIP_RATIO = 0.45     # 单帧「糊」的门限（相对参考清晰度）
+BLUR_AREA_RATIO = 0.15    # 低于门限的帧占比超过这个值，才算「持续糊过」
+BLUR_MIN_FRAMES = 6
+MOTION_BLUR_LABELS = ("Whip Pan", "Crash Zoom", "Shake")
+
+
+def sharpness_curve(frames, s, e, maxw=None):
+    """逐帧 Laplacian 方差（越大越清晰）。这是运动模糊最便宜的代理指标。"""
+    out = []
+    for i in range(s, e + 1):
+        g = frames[i]
+        if maxw and g.shape[1] > maxw:
+            sc = maxw / float(g.shape[1])
+            g = cv2.resize(g, (maxw, max(2, int(round(g.shape[0] * sc)))),
+                           interpolation=cv2.INTER_AREA)
+        out.append(float(cv2.Laplacian(g, cv2.CV_64F).var()))
+    return out
+
+
+def analyze_blur(sharp, fps):
+    """
+    检测强运动模糊（甩镜 / 急变焦 / 强抖动的签名）。
+
+    ⚠️ 这里的判据是实测改出来的，别按直觉改回去：
+    最初假设「清晰→糊→恢复」的 V 形，结果 G_5005（已抽帧确认是完整甩镜）
+    实测是**一直糊到结尾**——甩完之后画面停在运动模糊上，并没有恢复清晰。
+    真实曲线（相对清晰度）：
+        f0 1.92 → f40 0.56 → f56 0.17（谷底）→ f120 0.42
+    所以判据必须是「糊过」而不是「恢复」。
+
+    对比参考：静止画面几乎全程 1.00（A_1001 波动 <±3%）。
+
+    返回：
+      has_blur     是否出现可信的强模糊段
+      dip_ratio    最低清晰度 / 参考清晰度（越小越糊）
+      blur_ratio   尾段清晰度 / 参考（判断有没有恢复）
+      profile      sharp-dip-recover / sharp-dip-hold / none
+    """
+    n = len(sharp)
+    if n < BLUR_MIN_FRAMES + 4:
+        return {"has_blur": False, "reason": "too_short", "n": n}
+
+    # 参考清晰度取 **90 分位**（最清晰的那批帧），不是首尾中位。
+    # ⚠️ 这里踩过坑：最初用「首尾各 20% 的中位」当基准，
+    #    但甩镜往往甩完就停在糊画面上（G_5005 尾段只有 0.42），
+    #    糊的尾段把基准拉低，于是整段看起来都"正常"——检测直接失效。
+    #    用高分位当基准，才等于「这段视频原本能有多清晰」。
+    arr = np.asarray(sharp, dtype=np.float64)
+    ref = float(np.percentile(arr, 90)) or 1e-6
+    rel = arr / ref
+
+    # 主判据用「低于门限的帧占比」，不用「连续段长度」。
+    # 实测：连续段会被谷底的微小抖动切断（G_5005 只连成 2 帧），
+    # 但整段里 66% 的帧其实都是糊的——按占比判才抓得住。
+    blur_mask = rel < BLUR_DIP_RATIO
+    area = float(blur_mask.mean())
+    lo = int(np.argmin(rel))
+    dip = float(rel[lo])
+    tail = float(np.median(rel[-max(2, int(n * 0.2)):]))
+
+    has = area >= BLUR_AREA_RATIO and int(blur_mask.sum()) >= BLUR_MIN_FRAMES
+
+    # 形状：甩完是否恢复清晰
+    if not has:
+        profile = "none"
+    elif tail >= 0.75:
+        profile = "sharp-dip-recover"
+    else:
+        profile = "sharp-dip-hold"
+
+    # 糊得最久的那一段（仅用于报告定位）
+    idx = np.where(blur_mask)[0]
+    seg_start = int(idx[0]) if len(idx) else None
+    seg_end = int(idx[-1]) if len(idx) else None
+
+    return {
+        "has_blur": bool(has),
+        "n": n,
+        "blur_area": round(area, 3),
+        "blur_frames": int(blur_mask.sum()),
+        "blur_start": seg_start, "blur_end": seg_end,
+        "blur_seconds": round(area * n / fps, 2) if has else 0.0,
+        "dip_ratio": round(dip, 3),
+        "dip_at": lo,
+        "tail_ratio": round(tail, 3),
+        "ref_sharpness": round(ref, 1),
+        "profile": profile,
+        "curve": [round(float(x), 2) for x in rel[:: max(1, n // 12)][:12]],
+    }
+
+
 # ---------------------------------------------------------------- 主测量
 def analyze(path, maxw=480, windows=3):
     """
@@ -271,7 +389,11 @@ def analyze(path, maxw=480, windows=3):
         s, e = bounds[k], bounds[k + 1] - 1
         if e <= s:
             continue
-        shots.append(measure_shot(frames, s, e, w, h, fps, k + 1, windows))
+        shot = measure_shot(frames, s, e, w, h, fps, k + 1, windows)
+        # 清晰度分析：与几何运动独立，单列
+        sharp = sharpness_curve(frames, s, e)
+        shot["blur"] = analyze_blur(sharp, fps)
+        shots.append(shot)
 
     return {
         "video": os.path.abspath(path),
@@ -686,6 +808,50 @@ def selftest():
                           else "不通过"))
 
     ok = prec_ok and sign_ok and contam_ok and neg_ok
+
+    print()
+    print("=" * 74)
+    print("自检 5：运动模糊检测 + 假切点过滤")
+    print("=" * 74)
+    # 合成一段「清晰 → 强运动模糊 → 保持糊」的序列（甩镜的真实形态）
+    # 注意：模糊必须是**逐帧剧烈变化**的，才会像真实甩镜那样在帧差上产生一串候选。
+    # 早先版本只是把同一个模糊结果渐变（每帧变化很小），候选点只有 2 个，
+    # 密度判据抓不住——合成用例本身就失真了。
+    rng2 = np.random.default_rng(31)
+    tex = rng2.integers(0, 256, (360, 640)).astype(np.uint8)
+    tex = cv2.GaussianBlur(tex, (3, 3), 0)
+    seq = []
+    for i in range(60):
+        if i < 12:
+            f = tex.copy()
+        else:
+            # 每帧用不同的横向位移 + 强度递增的模糊，模拟相机高速旋转
+            dx = int(6 + (i - 12) * 9)
+            k = 3 + int(30 * min(1.0, (i - 12) / 10.0))
+            shifted = np.roll(tex, dx, axis=1)
+            f = cv2.blur(shifted, (k, 1))
+        seq.append(f)
+    sharp = sharpness_curve(seq, 0, len(seq) - 1)
+    b = analyze_blur(sharp, 24.0)
+    blur_ok = bool(b["has_blur"])
+    print("  合成甩镜段 : has_blur=%s  dip=%.3f  profile=%s  （期望 True）"
+          % (b["has_blur"], b.get("dip_ratio", 0), b.get("profile", "")))
+    print("  判定：%s" % ("通过" if blur_ok else "不通过 —— 强模糊没被检出"))
+
+    # 静止段不该报模糊（阴性对照）
+    flat = [tex.copy() for _ in range(60)]
+    b2 = analyze_blur(sharpness_curve(flat, 0, 59), 24.0)
+    neg2_ok = not b2["has_blur"]
+    print("  静止段     : has_blur=%s  （期望 False）" % b2["has_blur"])
+    print("  判定：%s" % ("通过" if neg2_ok else "不通过 —— 把清晰画面误报成模糊"))
+
+    # 模糊过渡不该被切成多个镜头（这条最容易回归）
+    cuts_fake, _ = detect_cuts(seq)
+    cut_ok = len(cuts_fake) == 0
+    print("  连续模糊段 : 检出切点=%s  （期望 []，不该把模糊当成硬切）" % cuts_fake)
+    print("  判定：%s" % ("通过" if cut_ok else "不通过 —— 模糊被误判成切镜"))
+
+    ok = ok and blur_ok and neg2_ok and cut_ok
     print()
     print("自检总结：%s" % ("全部通过" if ok else "有超差项 —— 不要拿测量结果下结论"))
     return 0 if ok else 1
