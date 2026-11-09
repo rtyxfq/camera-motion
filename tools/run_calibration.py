@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from comfyapi import submit, wait, outputs_of, download  # noqa: E402
 
-ROOT = os.path.dirname(HERE)          # 仓库根，产物写到这儿，别写进 tools/
+ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, "runs", "videos")
 LOGS = os.path.join(ROOT, "runs")
 
@@ -100,6 +100,29 @@ GROUPS = {
         "desc": "Push In + large（只测幅度）",
         "camera": " The camera pushes in with large amplitude.",
     },
+    # ---- 第三轮：whip pan 验证 ----
+    # 官方 12 类词表里没有 whip pan，但本机 3 个工作流在用它。
+    # 这是"正在使用、可能一直无效"的最高风险项，必须先测。
+    # G: 直写官方不认的词
+    "G": {
+        "desc": "whip pan 裸写（测官方未列词是否生效）",
+        "camera": " The camera whip pans.",
+    },
+    # H: 拆成官方词 + 快速度，作为"如果 G 无效就改用这个"的备选
+    #    宽度：横向位移预期大，便于和 G 对比
+    "H": {
+        "desc": "Pan left + fast（whip pan 的官方词替代方案）",
+        "camera": " The camera pans left at fast speed.",
+    },
+    # ---- 第四轮：词表是否封闭 ----
+    # 这条是 P0 里所有 ❌/⬜ 判定的上游问题。
+    # 官方原文只说 "Available Expression"，从没说封闭集合。
+    # 若 I 与 C（pushes in）效果相当 → 词表不封闭，同义词可用；
+    # 若 I 明显更弱/无效 → 词表趋近封闭，必须换官方词。
+    "I": {
+        "desc": "dollies in（非官方同义词，对照 C 组）",
+        "camera": " The camera dollies in.",
+    },
 }
 
 # 补跑用的新种子（不与第一轮重复，避免同 seed 覆盖或复用同一随机流）
@@ -111,11 +134,11 @@ def build_prompt(camera_sentence):
 
 
 def seeds_for_group(g):
-    """第一轮 A–D 用 SEEDS；新加的 E/F 用 SEEDS_ROUND2。
+    """第一轮 A–D 用 SEEDS；E/F 及之后的新组用 SEEDS_ROUND2。
 
     补跑 C/D 时用 --seeds 显式传入新种子，避免和已有数据同 seed。
     """
-    return SEEDS_ROUND2 if g in ("E", "F") else SEEDS
+    return SEEDS_ROUND2 if g in ("E", "F", "G", "H", "I") else SEEDS
 
 
 def build_workflow(prompt, seed, group="X"):
